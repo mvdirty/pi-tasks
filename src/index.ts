@@ -876,14 +876,6 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
-  pi.on("session_fork" as any, async (_event: any, ctx: ExtensionContext) => {
-    resetSessionState(ctx);
-  });
-
-  pi.on("session_switch" as any, async (_event: any, ctx: ExtensionContext) => {
-    resetSessionState(ctx);
-  });
-
   pi.on("session_tree" as any, async (_event: any, ctx: ExtensionContext) => {
     resetSessionState(ctx);
   });
