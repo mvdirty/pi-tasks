@@ -797,7 +797,7 @@ describe("pi-tasks extension", () => {
     for (let turn = 0; turn < 10; turn++) {
       await mock.fireLifecycle("turn_start", {}, ctx);
     }
-    await mock.fireLifecycle("session_switch", { reason: "resume" }, ctx);
+    await mock.fireLifecycle("session_start", { reason: "resume" }, ctx);
 
     expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#1 [completed] Done");
     expect(existsSync(join(storePath, "1.json"))).toBe(true);
