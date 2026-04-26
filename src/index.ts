@@ -719,7 +719,7 @@ export default function (pi: ExtensionAPI) {
     else resolveActiveTaskId();
   }
 
-  function getTaskWidgetLines(ctx: ExtensionContext): string[] | undefined {
+  function getTaskWidgetLines(ctx: ExtensionContext, width: number): string[] | undefined {
     if (!ctx.hasUI || widgetView === "hidden") return undefined;
 
     widgetCtx = ctx;
@@ -745,11 +745,11 @@ export default function (pi: ExtensionAPI) {
         const stats = formatTaskStatsInline(todo);
         if (stats) line += ` ${theme.fg("muted", `· ${stats}`)}`;
         if (todo.status === "completed") line = theme.fg("muted", line);
-        lines.push(truncateToWidth(line, 120));
+        lines.push(line);
       }
     }
 
-    return lines;
+    return lines.map((line) => truncateToWidth(line, width));
   }
 
   function ensureTaskWidgetRegistered(ctx: ExtensionContext) {
@@ -758,7 +758,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget(TASK_WIDGET_KEY, (tui: { requestRender?: () => void }) => {
       widgetTui = tui;
       return {
-        render: () => getTaskWidgetLines(widgetCtx ?? ctx) ?? [],
+        render: (width: number) => getTaskWidgetLines(widgetCtx ?? ctx, width) ?? [],
         invalidate: () => {},
         dispose: () => {
           widgetRegistered = false;

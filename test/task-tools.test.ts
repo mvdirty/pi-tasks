@@ -30,10 +30,10 @@ afterEach(() => {
 function mockCtx(sessionId: string, hasUI = false, options?: { confirmResponses?: boolean[]; sessionFile?: string; leafId?: string | null }) {
   const widgets = new Map<string, string[] | undefined>();
   const widgetSetCalls = new Map<string, number>();
-  const widgetComponents = new Map<string, { render?: () => string[]; dispose?: () => void }>();
-  const renderWidget = (key: string) => {
+  const widgetComponents = new Map<string, { render?: (width: number) => string[]; dispose?: () => void }>();
+  const renderWidget = (key: string, width = 80) => {
     const component = widgetComponents.get(key);
-    widgets.set(key, component?.render ? component.render() : undefined);
+    widgets.set(key, component?.render ? component.render(width) : undefined);
   };
   const notifications: Array<{ message: string; level: string }> = [];
   const confirmCalls: Array<{ title: string; message: string }> = [];
@@ -85,6 +85,9 @@ function mockCtx(sessionId: string, hasUI = false, options?: { confirmResponses?
     },
     model: { id: "test", name: "test" },
     modelRegistry: {},
+    renderWidget(key: string, width = 80) {
+      renderWidget(key, width);
+    },
     setLeafId(nextLeafId: string | null) {
       leafId = nextLeafId;
     },
@@ -718,6 +721,31 @@ describe("pi-tasks extension", () => {
 
     await mock.executeCommand("tasks", "all", ctx);
     expect(ctx.widgets.get("tasks")?.[0]).toBe("Tasks");
+
+    cleanupStore(storePath);
+  });
+
+  it("truncates every widget line to the render width", async () => {
+    const sessionId = `todo-widget-width-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    const mock = mockPi();
+    const ctx = mockCtx(sessionId, true);
+    initExtension(mock.pi as any);
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+    await mock.executeTool("task_create", {
+      subject: "Rename pi-share traces to pi-r2-share",
+      description: "Desc",
+      status: "in_progress",
+    }, ctx);
+    await mock.fireLifecycle("tool_execution_end", { toolName: "bash", toolCallId: "call-2", result: {}, isError: false }, ctx);
+    await mock.fireLifecycle("message_end", { message: { role: "assistant", usage: { output: 2049 } } }, ctx);
+
+    ctx.renderWidget("tasks", 76);
+
+    expect(ctx.widgets.get("tasks")?.every((line) => line.length <= 76)).toBe(true);
+    expect(ctx.widgets.get("tasks")?.[2]).toBe("▶ #1 Rename pi-share traces to pi-r2-share · 0s · 1 tool · 2,049 tokens");
 
     cleanupStore(storePath);
   });
