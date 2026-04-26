@@ -30,7 +30,7 @@
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "typebox": "*"
   },
   "scripts": {
     "build": "tsc",
@@ -40,10 +40,10 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.68.1",
-    "@mariozechner/pi-tui": "^0.68.1",
-    "@sinclair/typebox": "^0.34.49",
+    "@mariozechner/pi-coding-agent": "^0.70.2",
+    "@mariozechner/pi-tui": "^0.70.2",
     "@types/node": "^20.0.0",
+    "typebox": "^1.1.33",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"
   },
