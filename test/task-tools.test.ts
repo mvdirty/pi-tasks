@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -726,6 +726,36 @@ describe("pi-tasks extension", () => {
     expect(ctx.widgets.get("tasks")?.[0]).toBe("Tasks");
 
     cleanupStore(storePath);
+  });
+
+  it("preserves symlinked settings.json when persisting the widget view", async () => {
+    const sessionId = `todo-widget-symlink-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    const targetAgentDir = mkdtempSync(join(tmpdir(), "pi-tasks-target-agent-"));
+    const settingsPath = join(testAgentDir, "settings.json");
+    const targetSettingsPath = join(targetAgentDir, "settings.json");
+    cleanupStore(storePath);
+
+    try {
+      writeFileSync(targetSettingsPath, `${JSON.stringify({ theme: "dark" }, null, 2)}\n`);
+      symlinkSync(targetSettingsPath, settingsPath);
+
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      await mock.executeCommand("tasks", "all", ctx);
+
+      expect(lstatSync(settingsPath).isSymbolicLink()).toBe(true);
+      expect(JSON.parse(readFileSync(targetSettingsPath, "utf-8"))).toEqual({
+        theme: "dark",
+        tasksMode: "all",
+      });
+    } finally {
+      cleanupStore(storePath);
+      rmSync(targetAgentDir, { recursive: true, force: true });
+    }
   });
 
   it("truncates every widget line to the render width", async () => {

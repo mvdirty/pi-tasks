@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -352,9 +352,7 @@ function persistTaskWidgetView(widgetView: TaskWidgetView): void {
   settings[TASK_WIDGET_SETTINGS_KEY] = widgetView;
   delete settings[TASK_WIDGET_LEGACY_NAMESPACE];
 
-  const tmpPath = `${settingsPath}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`);
-  renameSync(tmpPath, settingsPath);
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
 }
 
 function getTaskStats(todo: Task | undefined): TaskStats {
