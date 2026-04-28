@@ -763,6 +763,7 @@ export default function (pi: ExtensionAPI) {
 
   function getTaskWidgetLines(ctx: ExtensionContext, width: number): string[] | undefined {
     if (!ctx.hasUI || widgetView === "hidden") return undefined;
+    if (widgetSuppressedForInput) return [];
 
     widgetCtx = ctx;
     const theme = ctx.ui.theme;
@@ -799,14 +800,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     return lines.map((line) => truncateToWidth(line, width));
-  }
-
-  function clearTaskWidget(ctx?: ExtensionContext) {
-    if (!ctx?.hasUI || !widgetRegistered) return;
-    stopWidgetTicker();
-    ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
-    widgetRegistered = false;
-    widgetTui = undefined;
   }
 
   function ensureTaskWidgetRegistered(ctx: ExtensionContext) {
@@ -878,7 +871,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI || widgetView === "hidden" || !widgetRegistered) return;
 
     widgetSuppressedForInput = true;
-    clearTaskWidget(ctx);
+    widgetTui?.requestRender?.();
   });
 
   pi.on("turn_start", async (_event, ctx) => {

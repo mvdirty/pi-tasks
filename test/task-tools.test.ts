@@ -871,7 +871,7 @@ describe("pi-tasks extension", () => {
     cleanupStore(storePath);
   });
 
-  it("temporarily clears the widget while a user message is submitted", async () => {
+  it("temporarily hides the widget without remounting while a user message is submitted", async () => {
     const sessionId = `todo-widget-input-clear-${Date.now()}`;
     const storePath = getSessionTaskDirPath(sessionId);
     cleanupStore(storePath);
@@ -888,10 +888,11 @@ describe("pi-tasks extension", () => {
       const setCallsBeforeInput = ctx.widgetSetCalls.get("tasks") ?? 0;
 
       await mock.fireLifecycle("input", { type: "input", text: "next", source: "interactive" }, ctx);
-      expect(ctx.widgets.get("tasks")).toBeUndefined();
-      expect(ctx.widgetSetCalls.get("tasks")).toBe(setCallsBeforeInput + 1);
+      expect(ctx.widgets.get("tasks")).toEqual([]);
+      expect(ctx.widgetSetCalls.get("tasks")).toBe(setCallsBeforeInput);
 
       await mock.fireLifecycle("message_end", { message: { role: "user", content: [{ type: "text", text: "next" }] } }, ctx);
+      expect(ctx.widgetSetCalls.get("tasks")).toBe(setCallsBeforeInput);
       expect(ctx.widgets.get("tasks")?.join("\n")).toContain("Done");
     } finally {
       cleanupStore(storePath);
