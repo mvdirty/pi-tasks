@@ -140,8 +140,8 @@ function mockPi() {
     commands,
     shortcuts,
     sentMessages,
-    async fireLifecycle(event: string, ...args: any[]) {
-      const results = [];
+    async fireLifecycle(event: string, ...args: any[]): Promise<any[]> {
+      const results: any[] = [];
       for (const handler of lifecycleHandlers.get(event) ?? []) {
         results.push(await handler(...args));
       }
@@ -372,7 +372,7 @@ describe("pi-tasks extension", () => {
     const get = await mock.executeTool("task_get", { taskId: "2" }, ctx);
 
     expect(list.content[0].text).toBe([
-      "#1 [completed] Completed blocker",
+      "#1 [completed] Completed blocker · 0s",
       "#2 [pending] Blocked pending [blocked by #4]",
       "#3 [in_progress] In progress · 0s",
       "#4 [pending] Open blocker",
@@ -432,8 +432,10 @@ describe("pi-tasks extension", () => {
       await mock.executeTool("task_update", { taskId: "1", status: "completed" }, ctx);
 
       const get = await mock.executeTool("task_get", { taskId: "1" }, ctx);
+      const list = await mock.executeTool("task_list", {}, ctx);
       const raw = readTaskFile(storePath, "1");
 
+      expect(list.content[0].text).toContain("#1 [completed] Instrumented · 20s · 1 tool · 30 tokens");
       expect(get.content[0].text).toContain("time to complete: 20s");
       expect(get.content[0].text).toContain("tool uses: 1");
       expect(get.content[0].text).toContain("output: 30 tokens");
@@ -700,14 +702,14 @@ describe("pi-tasks extension", () => {
         "2 open · 18 completed · 20 total · Ctrl+Alt+T to cycle",
         "▶ #19 Current · 0s",
         "○ #20 Next",
-        "✓ #18 Old done 18",
-        "✓ #17 Old done 17",
-        "✓ #16 Old done 16",
-        "✓ #15 Old done 15",
-        "✓ #14 Old done 14",
-        "✓ #13 Old done 13",
-        "✓ #12 Old done 12",
-        "✓ #11 Old done 11",
+        "✓ #18 Old done 18 · 0s",
+        "✓ #17 Old done 17 · 0s",
+        "✓ #16 Old done 16 · 0s",
+        "✓ #15 Old done 15 · 0s",
+        "✓ #14 Old done 14 · 0s",
+        "✓ #13 Old done 13 · 0s",
+        "✓ #12 Old done 12 · 0s",
+        "✓ #11 Old done 11 · 0s",
         "… 10 more",
       ]);
     } finally {
@@ -744,10 +746,10 @@ describe("pi-tasks extension", () => {
         "2 open · 18 completed · 20 total · Ctrl+Alt+T to cycle",
         "▶ #19 Current · 0s",
         "○ #20 Next",
-        "✓ #18 Old done 18",
-        "✓ #17 Old done 17",
-        "✓ #16 Old done 16",
-        "✓ #15 Old done 15",
+        "✓ #18 Old done 18 · 0s",
+        "✓ #17 Old done 17 · 0s",
+        "✓ #16 Old done 16 · 0s",
+        "✓ #15 Old done 15 · 0s",
         "… 14 more",
       ]);
     } finally {
@@ -782,7 +784,7 @@ describe("pi-tasks extension", () => {
       "Tasks",
       "1 open · 1 completed · 2 total · Ctrl+Alt+T to cycle",
       "○ #2 Open",
-      "✓ #1 Done",
+      "✓ #1 Done · 0s",
     ]);
     expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({
       tasksMode: "all",
@@ -865,7 +867,7 @@ describe("pi-tasks extension", () => {
 
     ctx.renderWidget("tasks", 76);
 
-    expect(ctx.widgets.get("tasks")?.every((line) => line.length <= 76)).toBe(true);
+    expect(ctx.widgets.get("tasks")?.every((line: string) => line.length <= 76)).toBe(true);
     expect(ctx.widgets.get("tasks")?.[2]).toBe("▶ #1 Rename pi-share traces to pi-r2-share · 0s · 1 tool · 2,049 tokens");
 
     cleanupStore(storePath);
@@ -998,7 +1000,7 @@ describe("pi-tasks extension", () => {
       { title: "Clear completed tasks?", message: "Permanently delete 1 completed task?" },
     ]);
     expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe([
-      "#1 [completed] Done",
+      "#1 [completed] Done · 0s",
       "#2 [pending] Open",
       "#3 [pending] Also open",
     ].join("\n"));
@@ -1036,7 +1038,7 @@ describe("pi-tasks extension", () => {
     }
     await mock.fireLifecycle("session_start", { reason: "resume" }, ctx);
 
-    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#1 [completed] Done");
+    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#1 [completed] Done · 0s");
     expect(existsSync(join(storePath, "1.json"))).toBe(true);
     expect(ctx.widgets.get("tasks")).toEqual([
       "Tasks",
@@ -1079,7 +1081,7 @@ describe("pi-tasks extension", () => {
     expect(firstReminder.messages[0].content).not.toContain("Done");
     expect(mock.sentMessages).toHaveLength(0);
 
-    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#2 [completed] Done\n#1 [pending] Open");
+    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#2 [completed] Done · 0s\n#1 [pending] Open");
     expect(readTaskFile(storePath, "2").status).toBe("completed");
 
     for (let turn = 0; turn < 9; turn++) {
@@ -1136,7 +1138,7 @@ describe("pi-tasks extension", () => {
     }
 
     expect(await mock.fireLifecycle("context", { messages: [] }, ctx)).toEqual([undefined]);
-    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#1 [completed] Done");
+    expect((await mock.executeTool("task_list", {}, ctx)).content[0].text).toBe("#1 [completed] Done · 0s");
 
     cleanupStore(storePath);
   });

@@ -483,7 +483,7 @@ function formatTaskStatsInline(todo: Task, options?: { includeLastTool?: boolean
   const stats = getTaskStats(todo);
   const parts: string[] = [];
   const runtimeMs = getTaskRuntimeMs(todo);
-  if (runtimeMs !== undefined && todo.status === "in_progress") {
+  if (runtimeMs !== undefined) {
     parts.push(formatDuration(runtimeMs));
   }
   if ((stats.toolUseCount ?? 0) > 0) {
