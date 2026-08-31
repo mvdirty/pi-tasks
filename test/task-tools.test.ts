@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +16,11 @@ function readTaskFile(storePath: string, taskId: string) {
 
 function widgetLines(lines: string[]) {
   return lines.map((line) => ` ${line}`);
+}
+
+function writeTaskFile(storePath: string, taskId: string, task: Record<string, unknown>) {
+  mkdirSync(storePath, { recursive: true });
+  writeFileSync(join(storePath, `${taskId}.json`), JSON.stringify(task));
 }
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -585,10 +590,12 @@ describe("pi-tasks extension", () => {
       await mock.createTask( { subject: "Instrumented", description: "Desc" }, ctx);
       await mock.updateTask( { taskId: "1", status: "in_progress" }, ctx);
 
+      await mock.fireLifecycle("agent_start", {}, ctx);
       vi.advanceTimersByTime(5_000);
       await mock.fireLifecycle("tool_execution_end", { toolName: "bash", toolCallId: "call-2", result: {}, isError: false }, ctx);
       await mock.fireLifecycle("message_end", { message: { role: "assistant", usage: { output: 30 } } }, ctx);
       vi.advanceTimersByTime(15_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
       await mock.updateTask( { taskId: "1", status: "completed" }, ctx);
 
       const get = await mock.taskDetail("1", ctx);
@@ -603,11 +610,49 @@ describe("pi-tasks extension", () => {
       expect(raw.metadata.stats).toMatchObject({
         startedAt: new Date("2026-04-15T12:00:00.000Z").getTime(),
         completedAt: new Date("2026-04-15T12:00:20.000Z").getTime(),
+        activeMs: 20_000,
         toolUseCount: 1,
         outputTokens: 30,
         lastToolName: "bash",
         lastToolAt: new Date("2026-04-15T12:00:05.000Z").getTime(),
       });
+      expect(raw.metadata.stats.activeSince).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("binds the session store before attributing an agent span", async () => {
+    vi.useFakeTimers();
+    const t0 = new Date("2026-04-15T12:30:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    const sessionId = `todo-agent-start-store-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Already active",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { activeMs: 0 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: t0,
+        updatedAt: t0,
+      });
+
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(3_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      expect(readTaskFile(storePath, "1").metadata.stats.activeMs).toBe(3_000);
     } finally {
       cleanupStore(storePath);
       vi.useRealTimers();
@@ -1260,6 +1305,7 @@ describe("pi-tasks extension", () => {
         "▶ #1 Live · 0s",
       ]));
 
+      await mock.fireLifecycle("agent_start", {}, ctx);
       vi.advanceTimersByTime(2_000);
       expect(ctx.widgets.get("tasks")).toEqual(widgetLines([
         "Tasks",
@@ -1275,15 +1321,496 @@ describe("pi-tasks extension", () => {
       ]));
 
       vi.advanceTimersByTime(36_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      vi.advanceTimersByTime(3_600_000);
+      expect(ctx.widgets.get("tasks")).toEqual(widgetLines([
+        "Tasks",
+        "1 open · 0 completed · Ctrl+Alt+T to cycle",
+        "▶ #1 Live · 38s · 18 tokens",
+      ]));
+
       await mock.updateTask( { taskId: "1", status: "completed" }, ctx);
       await mock.createTask( { subject: "Second", description: "Desc", status: "in_progress" }, ctx);
+      await mock.fireLifecycle("agent_start", {}, ctx);
       vi.advanceTimersByTime(62_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
       await mock.updateTask( { taskId: "2", status: "completed" }, ctx);
       expect(ctx.widgets.get("tasks")).toEqual(widgetLines([
         "Tasks",
         "0 open · 2 completed (1m 40s) · Ctrl+Alt+T to cycle",
         "No open tasks",
       ]));
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves active runtime when a completed task is moved back to pending", async () => {
+    vi.useFakeTimers();
+    const t0 = new Date("2026-04-15T13:30:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    const sessionId = `todo-reopen-active-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.createTask( { subject: "Reopen", description: "Desc" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "in_progress" }, ctx);
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(7_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+      await mock.updateTask( { taskId: "1", status: "completed" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "pending" }, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.status).toBe("pending");
+      expect(raw.metadata.stats).toMatchObject({ activeMs: 7_000 });
+      expect(raw.metadata.stats.completedAt).toBeUndefined();
+      expect((await mock.taskDetail("1", ctx)).content[0].text).toContain("runtime: 7s");
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps in-progress stats when moving an unfinished task to pending", async () => {
+    vi.useFakeTimers();
+    const t0 = new Date("2026-04-15T13:40:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    const sessionId = `todo-pending-active-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.createTask( { subject: "Unfinished", description: "Desc" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "in_progress" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "pending" }, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.status).toBe("pending");
+      expect(raw.metadata.stats).toMatchObject({
+        startedAt: t0,
+        activeMs: 0,
+      });
+      expect(raw.metadata.stats.completedAt).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not create lifecycle stats for a pending task with no runtime history", async () => {
+    const sessionId = `todo-pending-without-stats-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.createTask( { subject: "Still pending", description: "Desc" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "pending" }, ctx);
+
+      expect(readTaskFile(storePath, "1").metadata.stats).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+    }
+  });
+
+  it("keeps legacy wall-clock fallback for tasks without active-time stats", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-04-15T13:45:00.000Z").getTime();
+    vi.setSystemTime(now);
+
+    const sessionId = `todo-legacy-runtime-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Legacy completed",
+        description: "Desc",
+        status: "completed",
+        metadata: { stats: { startedAt: now - 20_000, completedAt: now } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 20_000,
+        updatedAt: now,
+      });
+      writeTaskFile(storePath, "2", {
+        id: "2",
+        subject: "Legacy active",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: now - 10_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 10_000,
+        updatedAt: now - 10_000,
+      });
+      writeTaskFile(storePath, "3", {
+        id: "3",
+        subject: "Legacy pending",
+        description: "Desc",
+        status: "pending",
+        metadata: { stats: { startedAt: now - 10_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 10_000,
+        updatedAt: now - 10_000,
+      });
+
+      expect((await mock.taskDetail("1", ctx)).content[0].text).toContain("time to complete: 20s");
+      expect((await mock.taskDetail("2", ctx)).content[0].text).toContain("runtime: 10s");
+      expect((await mock.taskDetail("3", ctx)).content[0].text).not.toContain("runtime:");
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts legacy active tasks with zero accumulated runtime", async () => {
+    vi.useFakeTimers();
+    const t0 = new Date("2026-04-15T13:55:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    const sessionId = `todo-legacy-active-span-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Legacy active",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: t0 - 10_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: t0 - 10_000,
+        updatedAt: t0 - 10_000,
+      });
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(2_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.metadata.stats).toMatchObject({ activeMs: 2_000 });
+      expect(raw.metadata.stats.activeSince).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores duplicate agent lifecycle events after one span is open or closed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-15T14:00:00.000Z"));
+
+    const sessionId = `todo-duplicate-agent-events-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.createTask( { subject: "Single span", description: "Desc", status: "in_progress" }, ctx);
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(2_000);
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(5_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.metadata.stats.activeMs).toBe(7_000);
+      expect(raw.metadata.stats.activeSince).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes an open span during session shutdown", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-15T14:15:00.000Z"));
+
+    const sessionId = `todo-shutdown-active-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.createTask( { subject: "Shutdown", description: "Desc", status: "in_progress" }, ctx);
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(9_000);
+      await mock.fireLifecycle("session_shutdown", {}, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.metadata.stats.activeMs).toBe(9_000);
+      expect(raw.metadata.stats.activeSince).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers dangling active spans from a crash and freezes legacy idle timers", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-15T14:00:00.000Z"));
+
+    const sessionId = `todo-active-recovery-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const now = Date.now();
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Crashed",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: now - 3_600_000, activeMs: 5_000, activeSince: now - 30_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 3_600_000,
+        updatedAt: now - 30_000,
+      });
+      writeTaskFile(storePath, "2", {
+        id: "2",
+        subject: "Legacy",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: now - 7_200_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 7_200_000,
+        updatedAt: now - 7_200_000,
+      });
+
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      const crashed = readTaskFile(storePath, "1");
+      expect(crashed.metadata.stats.activeSince).toBeUndefined();
+      expect(crashed.metadata.stats.activeMs).toBe(5_000);
+
+      const legacy = readTaskFile(storePath, "2");
+      expect(legacy.metadata.stats.activeMs).toBe(0);
+
+      vi.advanceTimersByTime(3_600_000);
+      const lines = (ctx.widgets.get("tasks") ?? []).join("\n");
+      expect(lines).toContain("▶ #1 Crashed · 5s");
+      expect(lines).toContain("▶ #2 Legacy · 0s");
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not seed active runtime on completed or pending legacy tasks", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-04-15T14:30:00.000Z").getTime();
+    vi.setSystemTime(now);
+
+    const sessionId = `todo-active-recovery-statuses-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Pending legacy",
+        description: "Desc",
+        status: "pending",
+        metadata: { stats: { startedAt: now - 20_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 20_000,
+        updatedAt: now - 20_000,
+      });
+      writeTaskFile(storePath, "2", {
+        id: "2",
+        subject: "Completed legacy",
+        description: "Desc",
+        status: "completed",
+        metadata: { stats: { startedAt: now - 20_000, completedAt: now - 5_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 20_000,
+        updatedAt: now - 5_000,
+      });
+
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      expect(readTaskFile(storePath, "1").metadata.stats.activeMs).toBeUndefined();
+      expect(readTaskFile(storePath, "2").metadata.stats.activeMs).toBeUndefined();
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not attribute a run to a task created after the run started", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-15T15:00:00.000Z"));
+
+    const sessionId = `todo-unattributed-span-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(30_000);
+      await mock.createTask( { subject: "Late", description: "Desc", status: "in_progress" }, ctx);
+      vi.advanceTimersByTime(10_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      const raw = readTaskFile(storePath, "1");
+      expect(raw.metadata.stats.activeMs).toBe(0);
+      expect(raw.metadata.stats.activeSince).toBeUndefined();
+      expect((ctx.widgets.get("tasks") ?? []).join("\n")).toContain("▶ #1 Late · 0s");
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps span ownership at run start and does not steal task recency from bookkeeping", async () => {
+    vi.useFakeTimers();
+    const t0 = new Date("2026-04-15T16:00:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    const sessionId = `todo-span-ownership-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      await mock.createTask( { subject: "First", description: "Desc" }, ctx);
+      await mock.updateTask( { taskId: "1", status: "in_progress" }, ctx);
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(5_000);
+      await mock.createTask( { subject: "Second", description: "Desc", status: "in_progress" }, ctx);
+      vi.advanceTimersByTime(5_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      const first = readTaskFile(storePath, "1");
+      expect(first.metadata.stats.activeMs).toBe(10_000);
+      expect(first.updatedAt).toBe(t0);
+
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(8_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      expect(readTaskFile(storePath, "1").metadata.stats.activeMs).toBe(10_000);
+      const second = readTaskFile(storePath, "2");
+      expect(second.metadata.stats.activeMs).toBe(8_000);
+      expect(second.updatedAt).toBe(t0 + 5_000);
+    } finally {
+      cleanupStore(storePath);
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles dangling spans without changing task recency", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-04-15T17:00:00.000Z").getTime();
+    vi.setSystemTime(now);
+
+    const sessionId = `todo-reconcile-recency-${Date.now()}`;
+    const storePath = getSessionTaskDirPath(sessionId);
+    cleanupStore(storePath);
+
+    try {
+      writeTaskFile(storePath, "1", {
+        id: "1",
+        subject: "Crashed",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: now - 7_200_000, activeMs: 5_000, activeSince: now - 30_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 7_200_000,
+        updatedAt: now - 7_200_000,
+      });
+      writeTaskFile(storePath, "2", {
+        id: "2",
+        subject: "Current",
+        description: "Desc",
+        status: "in_progress",
+        metadata: { stats: { startedAt: now - 60_000 } },
+        blocks: [],
+        blockedBy: [],
+        createdAt: now - 60_000,
+        updatedAt: now - 60_000,
+      });
+
+      const mock = mockPi();
+      const ctx = mockCtx(sessionId, true);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+      const crashed = readTaskFile(storePath, "1");
+      expect(crashed.metadata.stats.activeSince).toBeUndefined();
+      expect(crashed.metadata.stats.activeMs).toBe(5_000);
+      expect(crashed.updatedAt).toBe(now - 7_200_000);
+      const current = readTaskFile(storePath, "2");
+      expect(current.metadata.stats.activeMs).toBe(0);
+      expect(current.updatedAt).toBe(now - 60_000);
+
+      await mock.fireLifecycle("agent_start", {}, ctx);
+      vi.advanceTimersByTime(4_000);
+      await mock.fireLifecycle("agent_end", {}, ctx);
+
+      expect(readTaskFile(storePath, "1").metadata.stats.activeMs).toBe(5_000);
+      expect(readTaskFile(storePath, "2").metadata.stats.activeMs).toBe(4_000);
     } finally {
       cleanupStore(storePath);
       vi.useRealTimers();

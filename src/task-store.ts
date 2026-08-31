@@ -50,6 +50,122 @@ type TaskUpdateFields = {
   addBlockedBy?: string[];
 };
 
+type DependencyField = "blocks" | "blockedBy";
+
+type DependencyRelation = {
+  todoField: DependencyField;
+  targetField: DependencyField;
+  hasCycle: (todo: Task, targetId: string, target: Task) => boolean;
+};
+
+function blocksHaveCycle(todo: Task, _targetId: string, target: Task): boolean {
+  return target.blocks.includes(todo.id);
+}
+
+function blockedByHasCycle(todo: Task, targetId: string, _target: Task): boolean {
+  return todo.blocks.includes(targetId);
+}
+
+const BLOCKS_RELATION: DependencyRelation = {
+  todoField: "blocks",
+  targetField: "blockedBy",
+  hasCycle: blocksHaveCycle,
+};
+
+const BLOCKED_BY_RELATION: DependencyRelation = {
+  todoField: "blockedBy",
+  targetField: "blocks",
+  hasCycle: blockedByHasCycle,
+};
+
+function touchTask(todo: Task): void {
+  todo.updatedAt = Date.now();
+}
+
+function applyTaskMetadata(todo: Task, metadata: Record<string, any>): void {
+  todo.metadata ??= {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value === null) delete todo.metadata[key];
+    else todo.metadata[key] = value;
+  }
+}
+
+function applyTaskFields(todo: Task, fields: TaskUpdateFields): string[] {
+  const changedFields: string[] = [];
+  if (isTaskStatus(fields.status)) {
+    todo.status = fields.status;
+    changedFields.push("status");
+  }
+  if (fields.subject !== undefined) {
+    todo.subject = fields.subject;
+    changedFields.push("subject");
+  }
+  if (fields.description !== undefined) {
+    todo.description = fields.description;
+    changedFields.push("description");
+  }
+  if (fields.activeForm !== undefined) {
+    todo.activeForm = fields.activeForm;
+    changedFields.push("activeForm");
+  }
+  if (fields.metadata !== undefined) {
+    applyTaskMetadata(todo, fields.metadata);
+    changedFields.push("metadata");
+  }
+  return changedFields;
+}
+
+function addReciprocalDependency(todo: Task | undefined, taskId: string, field: DependencyField): void {
+  if (!todo || todo[field].includes(taskId)) return;
+  todo[field].push(taskId);
+  touchTask(todo);
+}
+
+function addDependencyWarning(
+  todo: Task,
+  targetId: string,
+  target: Task | undefined,
+  relation: DependencyRelation,
+  warnings: string[],
+): void {
+  if (targetId === todo.id) warnings.push(`#${todo.id} blocks itself`);
+  else if (!target) warnings.push(`#${targetId} does not exist`);
+  else if (relation.hasCycle(todo, targetId, target)) warnings.push(`cycle: #${todo.id} and #${targetId} block each other`);
+}
+
+function applyDependencyEdges(
+  todos: Map<string, Task>,
+  todo: Task,
+  targetIds: string[],
+  relation: DependencyRelation,
+  warnings: string[],
+): void {
+  for (const targetId of targetIds) {
+    const todoIds = todo[relation.todoField];
+    if (!todoIds.includes(targetId)) todoIds.push(targetId);
+    const target = todos.get(targetId);
+    addReciprocalDependency(target, todo.id, relation.targetField);
+    addDependencyWarning(todo, targetId, target, relation, warnings);
+  }
+}
+
+function applyDependencyUpdates(todos: Map<string, Task>, todo: Task, fields: TaskUpdateFields, warnings: string[]): string[] {
+  const changedFields: string[] = [];
+  if (fields.addBlocks?.length) {
+    applyDependencyEdges(todos, todo, fields.addBlocks, BLOCKS_RELATION, warnings);
+    changedFields.push("blocks");
+  }
+  if (fields.addBlockedBy?.length) {
+    applyDependencyEdges(todos, todo, fields.addBlockedBy, BLOCKED_BY_RELATION, warnings);
+    changedFields.push("blockedBy");
+  }
+  return changedFields;
+}
+
+function touchUpdatedTask(todo: Task, changedFields: string[], preserveUpdatedAt: boolean | undefined): void {
+  if (changedFields.length > 0 && !preserveUpdatedAt) touchTask(todo);
+}
+
 type TaskBatchOperation =
   | {
       type: "create";
@@ -405,6 +521,7 @@ export class TaskStore {
     todos: Map<string, Task>,
     id: string,
     fields: TaskUpdateFields,
+    options?: { preserveUpdatedAt?: boolean },
   ): { todo: Task | undefined; changedFields: string[]; warnings: string[] } {
     const todo = todos.get(id);
     if (!todo) return { todo: undefined, changedFields: [], warnings: [] };
@@ -414,68 +531,10 @@ export class TaskStore {
       return { todo: undefined, changedFields: ["deleted"], warnings: [] };
     }
 
-    const changedFields: string[] = [];
     const warnings: string[] = [];
-    const touch = (current: Task) => {
-      current.updatedAt = Date.now();
-    };
-
-    if (fields.status !== undefined) {
-      todo.status = fields.status;
-      changedFields.push("status");
-    }
-    if (fields.subject !== undefined) {
-      todo.subject = fields.subject;
-      changedFields.push("subject");
-    }
-    if (fields.description !== undefined) {
-      todo.description = fields.description;
-      changedFields.push("description");
-    }
-    if (fields.activeForm !== undefined) {
-      todo.activeForm = fields.activeForm;
-      changedFields.push("activeForm");
-    }
-    if (fields.metadata !== undefined) {
-      todo.metadata ??= {};
-      for (const [key, value] of Object.entries(fields.metadata)) {
-        if (value === null) delete todo.metadata[key];
-        else todo.metadata[key] = value;
-      }
-      changedFields.push("metadata");
-    }
-
-    if (fields.addBlocks?.length) {
-      for (const targetId of fields.addBlocks) {
-        if (!todo.blocks.includes(targetId)) todo.blocks.push(targetId);
-        const target = todos.get(targetId);
-        if (target && !target.blockedBy.includes(id)) {
-          target.blockedBy.push(id);
-          touch(target);
-        }
-        if (targetId === id) warnings.push(`#${id} blocks itself`);
-        else if (!target) warnings.push(`#${targetId} does not exist`);
-        else if (target.blocks.includes(id)) warnings.push(`cycle: #${id} and #${targetId} block each other`);
-      }
-      changedFields.push("blocks");
-    }
-
-    if (fields.addBlockedBy?.length) {
-      for (const targetId of fields.addBlockedBy) {
-        if (!todo.blockedBy.includes(targetId)) todo.blockedBy.push(targetId);
-        const target = todos.get(targetId);
-        if (target && !target.blocks.includes(id)) {
-          target.blocks.push(id);
-          touch(target);
-        }
-        if (targetId === id) warnings.push(`#${id} blocks itself`);
-        else if (!target) warnings.push(`#${targetId} does not exist`);
-        else if (todo.blocks.includes(targetId)) warnings.push(`cycle: #${id} and #${targetId} block each other`);
-      }
-      changedFields.push("blockedBy");
-    }
-
-    if (changedFields.length > 0) touch(todo);
+    const changedFields = applyTaskFields(todo, fields);
+    changedFields.push(...applyDependencyUpdates(todos, todo, fields, warnings));
+    touchUpdatedTask(todo, changedFields, options?.preserveUpdatedAt);
 
     return {
       todo,
@@ -510,11 +569,15 @@ export class TaskStore {
       .map(cloneTask);
   }
 
-  update(id: string, fields: TaskUpdateFields): { todo: Task | undefined; changedFields: string[]; warnings: string[] } {
+  update(
+    id: string,
+    fields: TaskUpdateFields,
+    options?: { preserveUpdatedAt?: boolean },
+  ): { todo: Task | undefined; changedFields: string[]; warnings: string[] } {
     if (fields.status !== undefined) assertTaskUpdateStatus(fields.status);
     return this.withLock(() => {
       const todos = cloneTasks(this.todos);
-      const result = this.updateInState(todos, id, fields);
+      const result = this.updateInState(todos, id, fields, options);
       if (!result.todo && result.changedFields.length === 0) return result;
       this.commitState(todos, this.nextId);
       return result;

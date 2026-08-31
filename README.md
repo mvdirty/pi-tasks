@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/f0229862-417b-4ef2-9486-2b8736b7ce87
 - branch-aware restore when you move around the session tree
 - fork-copy behavior when you fork a session
 - hidden read-only reminders after 10 turns without task-tool use
-- per-task stats for runtime, tool usage, last tool, and output tokens
+- per-task stats for agent-active runtime, tool usage, last tool, and output tokens
 - output token accounting also includes subagent results, including [`pi-subagents`](https://github.com/edxeth/pi-subagents)
 - atomic `task_write` updates with file locking
 - no recycled task IDs
@@ -86,7 +86,9 @@ Open work is kept separate from completed work. Blockers are tracked bidirection
 
 After 10 turns of not using the task tools, `pi-tasks` injects a hidden reminder into context. It is read-only. It lists open tasks only. It does not spam the visible transcript.
 
-Task stats are stored in `metadata.stats` and updated from real execution: start time, completion time, tool count, last tool, and output tokens. That token accounting also includes subagent output from [`pi-subagents`](https://github.com/edxeth/pi-subagents), so child-agent output is counted back into the parent task.
+Task stats are stored in `metadata.stats` and updated from real execution: start time, completion time, agent-active runtime, tool count, last tool, and output tokens. That token accounting also includes subagent output from [`pi-subagents`](https://github.com/edxeth/pi-subagents), so child-agent output is counted back into the parent task.
+
+Task runtime counts only agent-active time: the spans between each `agent_start` and `agent_end`, which cover LLM streaming, tool runs, and subagent tool calls inside an agent loop run. Gaps between runs — reading or composing a prompt, auto-compaction, retry backoff — do not tick the timer. A run is credited to the task that was in progress when the run started; a run that starts before any task is in progress is not attributed. If pi stops hard mid-run, the unclosed span is dropped on the next session start, so a crash can undercount but never inflate. In-progress tasks recorded before this behavior existed switch to active-time tracking at their next session start; their timer stops growing until an agent actually runs on them. Completed tasks keep the wall-clock time they were completed with.
 
 `task_write` is all-or-nothing. If one operation fails, none of it commits. No half-written garbage.
 

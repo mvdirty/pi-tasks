@@ -47,10 +47,45 @@ type TaskUsageStats = {
 type TaskStats = TaskUsageStats & {
   startedAt?: number;
   completedAt?: number;
+  activeMs?: number;
+  activeSince?: number;
   toolUseCount?: number;
   lastToolName?: string;
   lastToolAt?: number;
 };
+
+type StatusStatsUpdater = (stats: TaskStats, now: number) => TaskStats | undefined;
+
+function getInProgressStats(stats: TaskStats, now: number): TaskStats {
+  return {
+    ...stats,
+    startedAt: stats.startedAt ?? now,
+    activeMs: stats.activeMs ?? 0,
+    completedAt: undefined,
+  };
+}
+
+function getCompletedStats(stats: TaskStats, now: number): TaskStats {
+  return {
+    ...stats,
+    startedAt: stats.startedAt ?? now,
+    completedAt: now,
+  };
+}
+
+function getPendingStats(stats: TaskStats): TaskStats | undefined {
+  if (stats.completedAt === undefined) return undefined;
+  return {
+    ...stats,
+    completedAt: undefined,
+  };
+}
+
+const STATUS_STATS_UPDATERS = new Map<string, StatusStatsUpdater>([
+  ["in_progress", getInProgressStats],
+  ["completed", getCompletedStats],
+  ["pending", getPendingStats],
+]);
 
 type TaskMetadata = Record<string, any>;
 
@@ -413,27 +448,7 @@ function mergeMetadata(userMetadata: TaskMetadata | undefined, stats: TaskStats 
 function withStatusStats(todo: Task | undefined, nextStatus: string | undefined, now = Date.now()): TaskStats | undefined {
   if (!nextStatus || nextStatus === "deleted") return undefined;
   const stats = getTaskStats(todo);
-  if (nextStatus === "in_progress") {
-    return {
-      ...stats,
-      startedAt: stats.startedAt ?? now,
-      completedAt: undefined,
-    };
-  }
-  if (nextStatus === "completed") {
-    return {
-      ...stats,
-      startedAt: stats.startedAt ?? now,
-      completedAt: now,
-    };
-  }
-  if (nextStatus === "pending" && stats.completedAt !== undefined) {
-    return {
-      ...stats,
-      completedAt: undefined,
-    };
-  }
-  return undefined;
+  return STATUS_STATS_UPDATERS.get(nextStatus)?.(stats, now);
 }
 
 function formatDuration(ms: number): string {
@@ -453,6 +468,11 @@ function formatTokenCount(count: number): string {
 
 function getTaskRuntimeMs(todo: Task, now = Date.now()): number | undefined {
   const stats = getTaskStats(todo);
+  if (stats.activeMs !== undefined) {
+    const openSpanMs = stats.activeSince !== undefined ? Math.max(0, now - stats.activeSince) : 0;
+    return Math.max(0, stats.activeMs) + openSpanMs;
+  }
+  // Fallback for tasks recorded before active-time tracking existed.
   if (!stats.startedAt) return undefined;
   if (stats.completedAt) return Math.max(0, stats.completedAt - stats.startedAt);
   if (todo.status === "in_progress") return Math.max(0, now - stats.startedAt);
@@ -572,6 +592,8 @@ export default function (pi: ExtensionAPI) {
   let widgetView: TaskWidgetView = readPersistedTaskWidgetView();
   let offPending = false;
   let activeTaskId: string | undefined;
+  let agentSpanSince: number | undefined;
+  let agentSpanTaskId: string | undefined;
   let widgetCtx: ExtensionContext | undefined;
   let widgetTicker: ReturnType<typeof setInterval> | undefined;
   let widgetRegistered = false;
@@ -681,12 +703,86 @@ export default function (pi: ExtensionAPI) {
     return activeTaskId;
   }
 
-  function updateTaskStats(taskId: string, update: (stats: TaskStats) => TaskStats, ctx?: ExtensionContext) {
+  function updateTaskStats(
+    taskId: string,
+    update: (stats: TaskStats) => TaskStats,
+    ctx?: ExtensionContext,
+    options?: { preserveUpdatedAt?: boolean },
+  ) {
     const todo = store.get(taskId);
     if (!todo) return;
     const nextStats = update(getTaskStats(todo));
-    store.update(taskId, { metadata: { [STATS_METADATA_KEY]: nextStats } });
+    store.update(taskId, { metadata: { [STATS_METADATA_KEY]: nextStats } }, options);
     updateTaskWidget(ctx);
+  }
+
+  // Agent-active time: an agent_start..agent_end span covers one agent loop run
+  // (LLM streaming, tool runs, subagent tool calls). Gaps between runs — user idle,
+  // auto-compaction, retry backoff — do not count. The span is credited to the task
+  // in progress when the run started; a run that starts before any task is in
+  // progress stays unattributed. Bookkeeping writes preserve Task.updatedAt so they
+  // cannot change which task later fallback attribution picks.
+  function openAgentActivitySpan(ctx: ExtensionContext) {
+    prepareStore(ctx);
+    if (agentSpanSince !== undefined) return;
+    const since = Date.now();
+    const taskId = resolveActiveTaskId();
+    agentSpanSince = since;
+    agentSpanTaskId = taskId;
+    if (taskId) {
+      updateTaskStats(
+        taskId,
+        (stats) => ({ ...stats, activeSince: since }),
+        ctx,
+        { preserveUpdatedAt: true },
+      );
+    }
+  }
+
+  function closeAgentActivitySpan(ctx?: ExtensionContext) {
+    if (agentSpanSince === undefined) return;
+    const since = agentSpanSince;
+    const taskId = agentSpanTaskId;
+    agentSpanSince = undefined;
+    agentSpanTaskId = undefined;
+    if (!taskId) return; // no task was in progress when the run started; the span stays unattributed
+    const elapsedMs = Math.max(0, Date.now() - since);
+    updateTaskStats(
+      taskId,
+      (stats) => {
+        const next = { ...stats, activeMs: (stats.activeMs ?? 0) + elapsedMs };
+        delete next.activeSince;
+        return next;
+      },
+      ctx,
+      { preserveUpdatedAt: true },
+    );
+  }
+
+  // Runs on session_start/session_tree: a persisted activeSince without a matching
+  // agent_end means pi stopped hard mid-run (crash or kill). Dropping it can only
+  // undercount, never inflate. Legacy in-progress tasks get activeMs seeded to 0 so
+  // their runtime stops growing with idle wall-clock time.
+  function reconcileActiveTimeStats() {
+    for (const todo of store.list()) {
+      const stats = getTaskStats(todo);
+      if (stats.activeSince !== undefined) {
+        updateTaskStats(
+          todo.id,
+          (current) => {
+            const next = { ...current };
+            delete next.activeSince;
+            return next;
+          },
+          undefined,
+          { preserveUpdatedAt: true },
+        );
+        continue;
+      }
+      if (stats.activeMs === undefined && todo.status === "in_progress") {
+        updateTaskStats(todo.id, (current) => ({ ...current, activeMs: 0 }), undefined, { preserveUpdatedAt: true });
+      }
+    }
   }
 
   function prepareCreateFields<T extends { status?: "pending" | "in_progress" | "completed"; metadata?: TaskMetadata }>(fields: T): T {
@@ -858,8 +954,11 @@ export default function (pi: ExtensionAPI) {
     lastReminderTurn = 0;
     emptyListNudgeShown = false;
     activeTaskId = undefined;
+    agentSpanSince = undefined;
+    agentSpanTaskId = undefined;
     if (ctx.hasUI) widgetCtx = ctx;
     prepareStore(ctx, options);
+    reconcileActiveTimeStats();
     updateTaskWidget(ctx);
   }
 
@@ -874,6 +973,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (_event, ctx) => {
     currentTurn++;
     prepareStore(ctx);
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    openAgentActivitySpan(ctx);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    closeAgentActivitySpan(ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -970,7 +1077,8 @@ export default function (pi: ExtensionAPI) {
     resetSessionState(ctx);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    closeAgentActivitySpan(ctx);
     stopWidgetTicker();
     widgetRegistered = false;
     widgetTui = undefined;

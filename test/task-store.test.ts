@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskStore } from "../src/task-store.js";
 
 describe("TaskStore (in-memory)", () => {
@@ -45,15 +45,70 @@ describe("TaskStore (in-memory)", () => {
     const result = store.update("1", {
       subject: "Updated",
       description: "New desc",
+      activeForm: "Updating",
       metadata: { review: "done" },
     });
 
-    expect(result.changedFields).toEqual(["subject", "description", "metadata"]);
+    expect(result.changedFields).toEqual(["subject", "description", "activeForm", "metadata"]);
     expect(store.get("1")).toMatchObject({
       subject: "Updated",
       description: "New desc",
+      activeForm: "Updating",
       metadata: { review: "done" },
     });
+  });
+
+  it("touches changed tasks but leaves no-op updates untouched", () => {
+    vi.useFakeTimers();
+    try {
+      const createdAt = new Date("2026-04-15T18:30:00.000Z").getTime();
+      vi.setSystemTime(createdAt);
+      store.create("Task", "Desc");
+
+      vi.advanceTimersByTime(1_000);
+      const changed = store.update("1", { subject: "Changed" });
+      expect(changed.todo?.updatedAt).toBe(createdAt + 1_000);
+
+      vi.advanceTimersByTime(1_000);
+      const unchanged = store.update("1", {});
+      expect(unchanged.changedFields).toEqual([]);
+      expect(unchanged.todo?.updatedAt).toBe(createdAt + 1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("removes metadata entries whose update value is null", () => {
+    store.create("Task", "Desc", undefined, undefined, { remove: "old", keep: "old" });
+
+    const result = store.update("1", { metadata: { remove: null, keep: "new" } });
+
+    expect(result.changedFields).toEqual(["metadata"]);
+    expect(store.get("1")?.metadata).toEqual({ keep: "new" });
+  });
+
+  it("can update metadata without changing updatedAt when requested", () => {
+    vi.useFakeTimers();
+    try {
+      const createdAt = new Date("2026-04-15T18:00:00.000Z").getTime();
+      vi.setSystemTime(createdAt);
+      store.create("Task", "Desc");
+
+      vi.advanceTimersByTime(1_000);
+      const result = store.update(
+        "1",
+        { metadata: { stats: { activeMs: 5_000 } } },
+        { preserveUpdatedAt: true },
+      );
+
+      expect(result.changedFields).toEqual(["metadata"]);
+      expect(store.get("1")).toMatchObject({
+        updatedAt: createdAt,
+        metadata: { stats: { activeMs: 5_000 } },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maintains bidirectional blockers", () => {
@@ -62,6 +117,37 @@ describe("TaskStore (in-memory)", () => {
 
     store.update("2", { addBlockedBy: ["1"] });
 
+    expect(store.get("1")?.blocks).toEqual(["2"]);
+    expect(store.get("2")?.blockedBy).toEqual(["1"]);
+  });
+
+  it("touches both tasks when adding a new dependency edge", () => {
+    vi.useFakeTimers();
+    try {
+      const createdAt = new Date("2026-04-15T18:45:00.000Z").getTime();
+      vi.setSystemTime(createdAt);
+      store.create("Blocker", "Desc");
+      store.create("Blocked", "Desc");
+
+      vi.advanceTimersByTime(1_000);
+      store.update("2", { addBlockedBy: ["1"] });
+
+      expect(store.get("1")?.updatedAt).toBe(createdAt + 1_000);
+      expect(store.get("2")?.updatedAt).toBe(createdAt + 1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps dependency edges unique and reports the changed field", () => {
+    store.create("Blocker", "Desc");
+    store.create("Blocked", "Desc");
+
+    const first = store.update("1", { addBlocks: ["2"] });
+    const second = store.update("1", { addBlocks: ["2"] });
+
+    expect(first.changedFields).toEqual(["blocks"]);
+    expect(second.changedFields).toEqual(["blocks"]);
     expect(store.get("1")?.blocks).toEqual(["2"]);
     expect(store.get("2")?.blockedBy).toEqual(["1"]);
   });
@@ -91,6 +177,7 @@ describe("TaskStore (in-memory)", () => {
     store.update("1", { addBlocks: ["2"] });
 
     expect(store.update("2", { addBlocks: ["1"] }).warnings).toContain("cycle: #2 and #1 block each other");
+    expect(store.update("2", { addBlockedBy: ["1"] }).warnings).toContain("cycle: #2 and #1 block each other");
     expect(store.update("1", { addBlocks: ["1"] }).warnings).toContain("#1 blocks itself");
     expect(store.update("1", { addBlocks: ["999"] }).warnings).toContain("#999 does not exist");
   });
@@ -204,6 +291,25 @@ describe("TaskStore (file-backed)", () => {
 
     const raw = JSON.parse(readFileSync(join(storePath, "2.json"), "utf-8"));
     expect(raw.status).toBe("completed");
+  });
+
+  it("initializes metadata when updating a legacy task without metadata", () => {
+    const store = new TaskStore(storePath);
+    writeFileSync(join(storePath, "1.json"), JSON.stringify({
+      id: "1",
+      subject: "Legacy",
+      description: "Desc",
+      status: "pending",
+      blocks: [],
+      blockedBy: [],
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+
+    const result = store.update("1", { metadata: { migrated: true } });
+
+    expect(result.changedFields).toEqual(["metadata"]);
+    expect(store.get("1")?.metadata).toEqual({ migrated: true });
   });
 
   it("does not reuse deleted IDs across new creates and restarts", () => {
