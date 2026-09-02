@@ -718,35 +718,22 @@ export default function (pi: ExtensionAPI) {
 
   // Agent-active time: an agent_start..agent_end span covers one agent loop run
   // (LLM streaming, tool runs, subagent tool calls). Gaps between runs — user idle,
-  // auto-compaction, retry backoff — do not count. The span is credited to the task
-  // in progress when the run started; a run that starts before any task is in
-  // progress stays unattributed. Bookkeeping writes preserve Task.updatedAt so they
-  // cannot change which task later fallback attribution picks.
-  function openAgentActivitySpan(ctx: ExtensionContext) {
-    prepareStore(ctx);
-    if (agentSpanSince !== undefined) return;
-    const since = Date.now();
-    const taskId = resolveActiveTaskId();
-    agentSpanSince = since;
-    agentSpanTaskId = taskId;
-    if (taskId) {
-      updateTaskStats(
-        taskId,
-        (stats) => ({ ...stats, activeSince: since }),
-        ctx,
-        { preserveUpdatedAt: true },
-      );
-    }
+  // auto-compaction, retry backoff — do not count. The open span accrues to the task
+  // currently in progress; when the active task changes mid-run (task_write), the
+  // span splits at that moment. Portions of a run with no in-progress task stay
+  // unattributed. Bookkeeping writes preserve Task.updatedAt so they cannot change
+  // which task later fallback attribution picks.
+  function persistActiveSince(taskId: string, since: number, ctx?: ExtensionContext) {
+    updateTaskStats(
+      taskId,
+      (stats) => ({ ...stats, activeSince: since }),
+      ctx,
+      { preserveUpdatedAt: true },
+    );
   }
 
-  function closeAgentActivitySpan(ctx?: ExtensionContext) {
-    if (agentSpanSince === undefined) return;
-    const since = agentSpanSince;
-    const taskId = agentSpanTaskId;
-    agentSpanSince = undefined;
-    agentSpanTaskId = undefined;
-    if (!taskId) return; // no task was in progress when the run started; the span stays unattributed
-    const elapsedMs = Math.max(0, Date.now() - since);
+  function creditActiveMs(taskId: string, since: number, now: number, ctx?: ExtensionContext) {
+    const elapsedMs = Math.max(0, now - since);
     updateTaskStats(
       taskId,
       (stats) => {
@@ -757,6 +744,37 @@ export default function (pi: ExtensionAPI) {
       ctx,
       { preserveUpdatedAt: true },
     );
+  }
+
+  function openAgentActivitySpan(ctx: ExtensionContext) {
+    prepareStore(ctx);
+    if (agentSpanSince !== undefined) return;
+    const since = Date.now();
+    const taskId = resolveActiveTaskId();
+    agentSpanSince = since;
+    agentSpanTaskId = taskId;
+    if (taskId) persistActiveSince(taskId, since, ctx);
+  }
+
+  function retargetAgentActivitySpan(taskId: string | undefined, ctx?: ExtensionContext) {
+    if (agentSpanSince === undefined || agentSpanTaskId === taskId) return;
+    const now = Date.now();
+    const since = agentSpanSince;
+    const previousTaskId = agentSpanTaskId;
+    agentSpanSince = now;
+    agentSpanTaskId = taskId;
+    if (previousTaskId) creditActiveMs(previousTaskId, since, now, ctx);
+    if (taskId) persistActiveSince(taskId, now, ctx);
+  }
+
+  function closeAgentActivitySpan(ctx?: ExtensionContext) {
+    if (agentSpanSince === undefined) return;
+    const since = agentSpanSince;
+    const taskId = agentSpanTaskId;
+    agentSpanSince = undefined;
+    agentSpanTaskId = undefined;
+    // a trailing portion with no in-progress task stays unattributed
+    if (taskId) creditActiveMs(taskId, since, Date.now(), ctx);
   }
 
   // Runs on session_start/session_tree: a persisted activeSince without a matching
@@ -840,6 +858,7 @@ export default function (pi: ExtensionAPI) {
     const active = chooseMostRecentInProgressTask(store.list());
     if (active) activeTaskId = active.id;
     else resolveActiveTaskId();
+    retargetAgentActivitySpan(activeTaskId);
   }
 
   function getTaskWidgetLines(ctx: ExtensionContext, width: number): string[] | undefined {
